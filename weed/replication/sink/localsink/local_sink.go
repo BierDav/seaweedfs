@@ -212,6 +212,12 @@ func (localsink *LocalSink) UpdateEntry(key string, oldEntry *filer_pb.Entry, ne
 		return true, nil
 	}
 	glog.V(4).Infof("Update Entry key: %s", key)
+	// Directory attributes are intentionally ignored, as in CreateEntry.
+	// Returning false would request a delete/create fallback that can remove
+	// a directory just created by a concurrent descendant copy.
+	if newEntry.IsDirectory {
+		return true, nil
+	}
 	// do delete and create
 	foundExistingEntry = util.FileExists(key)
 	err = localsink.CreateEntry(key, newEntry, signatures)
