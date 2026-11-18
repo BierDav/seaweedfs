@@ -224,6 +224,10 @@ func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOpti
 	}
 
 	generated := genProcessFunction(sourcePath, targetPath, excludePaths, reExcludeFileName, excludeFileNames, excludePathPatterns, dataSink, *backupOption.doDeleteFiles, debug)
+	// Coalesce only intermediate updates in the latest-state local mirror.
+	if dataSink.GetName() == "local" && !dataSink.IsIncremental() {
+		generated = backupLiveFileUpdates(filerSource, generated)
+	}
 	if flattener != nil {
 		inner := generated
 		generated = func(resp *filer_pb.SubscribeMetadataResponse) error {
