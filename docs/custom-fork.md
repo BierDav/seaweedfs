@@ -41,3 +41,4 @@ merges the newest SeaweedFS release every six hours into the branch
 - **A ruleset on `patched`:** a pull request and the checks `test`, `build` and `fork-kit/hold`;
   no force pushes or deletion. Repository admins may bypass it.
 - **Auto-merge** is allowed in the repository settings.
+
