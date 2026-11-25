@@ -44,7 +44,7 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app.outputs.token }}
       - id: fork-kit
-        uses: BierDav/fork-kit@e967a959fbebff8b0185ab1a27699b776cdd0876 # v0.3.0
+        uses: BierDav/fork-kit@5d9a9773a2a47e605704346654429963d10f9698 # v0.3.1
         with:
           command: sync
           token: ${{ steps.app.outputs.token }}
@@ -79,7 +79,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: BierDav/fork-kit@e967a959fbebff8b0185ab1a27699b776cdd0876 # v0.3.0
+      - uses: BierDav/fork-kit@5d9a9773a2a47e605704346654429963d10f9698 # v0.3.1
         with:
           command: guard
           token: ${{ github.token }}
