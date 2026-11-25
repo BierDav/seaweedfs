@@ -26,7 +26,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -47,15 +46,14 @@ import (
 )
 
 func (iam *IdentityAccessManagement) reqSignatureV4Verify(r *http.Request) (*Identity, s3err.ErrorCode) {
-	switch {
-	case isRequestSignatureV4(r):
-		identity, _, errCode := iam.doesSignatureMatch(r)
-		return identity, errCode
-	case isRequestPresignedSignatureV4(r):
-		identity, _, errCode := iam.doesPresignedSignatureMatch(r)
+	if !isRequestSignatureV4(r) && !isRequestPresignedSignatureV4(r) {
+		return nil, s3err.ErrAccessDenied
+	}
+	identity, _, _, authInfo, errCode := iam.verifyV4Signature(r, false)
+	if errCode != s3err.ErrNone {
 		return identity, errCode
 	}
-	return nil, s3err.ErrAccessDenied
+	return identity, bindSignedPayload(r, authInfo.HashedPayload)
 }
 
 // Constants specific to this file
@@ -80,7 +78,7 @@ func streamHashRequestBody(r *http.Request, sizeLimit int64) (string, error) {
 		return "", err
 	}
 
-	r.Body = io.NopCloser(bytes.NewReader(body))
+	(&signedPayloadBody{data: bytes.NewReader(body)}).wrap(&r.Body)
 
 	if len(body) == 0 {
 		return emptySHA256, nil
@@ -531,6 +529,20 @@ func (iam *IdentityAccessManagement) validateSTSSessionToken(r *http.Request, se
 	claims := make(map[string]interface{}, len(sessionInfo.RequestContext))
 	for k, v := range sessionInfo.RequestContext {
 		claims[k] = v
+	}
+	// Token attributes reach the request context; only the bearer path asserts trusted issuers.
+	delete(claims, "seaweed:oidc-issuers")
+	// The session's user is the one it was issued to, never a claim the
+	// identity provider forwarded.
+	if sessionInfo.ExternalUserId != "" {
+		claims["aws:username"] = sessionInfo.ExternalUserId
+	} else {
+		delete(claims, "aws:username")
+	}
+	if sessionInfo.ParentUser != "" {
+		claims["aws:userid"] = sessionInfo.ParentUser
+	} else {
+		delete(claims, "aws:userid")
 	}
 
 	// Key the principal on the OIDC subject so a session resolves to the same
@@ -1121,19 +1133,29 @@ func bucketFromVirtualHost(host, domainConfig string) (string, bool) {
 	if domainConfig == "" {
 		return "", false
 	}
-	h := host
+	host = strings.ToLower(host)
+	hostWithoutPort := host
 	if hh, _, err := net.SplitHostPort(host); err == nil {
-		h = hh
+		hostWithoutPort = hh
 	}
-	h = strings.ToLower(h)
+	// The router matches a domain that names a port against the full host:port.
+	hostFor := func(domain string) string {
+		if strings.Contains(domain, ":") {
+			return host
+		}
+		return hostWithoutPort
+	}
 	pathStyleDomains, virtualHostDomains := classifyDomainNames(strings.Split(domainConfig, ","))
 	for _, domain := range pathStyleDomains {
-		if h == strings.ToLower(strings.TrimSpace(domain)) {
+		domain = strings.ToLower(strings.TrimSpace(domain))
+		if hostFor(domain) == domain {
 			return "", false
 		}
 	}
 	for _, domain := range virtualHostDomains {
-		suffix := "." + strings.ToLower(strings.TrimSpace(domain))
+		domain = strings.ToLower(strings.TrimSpace(domain))
+		h := hostFor(domain)
+		suffix := "." + domain
 		if strings.HasSuffix(h, suffix) {
 			bucket := h[:len(h)-len(suffix)]
 			if bucket != "" {

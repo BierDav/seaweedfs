@@ -102,7 +102,7 @@ func (s3a *S3ApiServer) extractZipObject(w http.ResponseWriter, r *http.Request,
 	requestQuery := parseRequestQuery(r)
 	archiveMd5 := r.Header.Get("Content-Md5")
 	var archiveMd5Hash hash.Hash
-	if archiveMd5 != "" {
+	if archiveMd5 != "" && !fips140Enforced() {
 		archiveMd5Hash = md5.New()
 		dataReader = io.TeeReader(dataReader, archiveMd5Hash)
 	}
@@ -177,6 +177,9 @@ func (s3a *S3ApiServer) extractZipObject(w http.ResponseWriter, r *http.Request,
 		}
 		if err := s3a.validateTableBucketObjectPath(bucket, memberKey); err != nil {
 			return s3err.ErrAccessDenied
+		}
+		if code := s3a.checkVersionFileWrite(bucket, memberKey, "extractZipObject"); code != s3err.ErrNone {
+			return code
 		}
 		if code, _ := s3a.checkPolicyWithEntry(r, bucket, memberKey, string(s3_constants.ACTION_WRITE), "", nil); code != s3err.ErrNone {
 			return code

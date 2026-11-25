@@ -211,6 +211,7 @@ const (
 	WriteCondition_IF_EXTENDED_TIME_ELAPSED WriteCondition_Kind = 8  // fail if present and extended[ext_key] (unix seconds) is in the future
 	WriteCondition_IF_CHUNKS_EQUAL          WriteCondition_Kind = 9  // fail unless the stored chunk fid multiset equals fids (absent entry = no chunks)
 	WriteCondition_IF_ENTRY_EQUAL           WriteCondition_Kind = 10 // fail unless the stored entry equals expected_entry
+	WriteCondition_IF_OBJECT_EXISTS         WriteCondition_Kind = 11 // fail if absent or a plain directory, one holding no object of its own (If-Match: * on a null version)
 )
 
 // Enum value maps for WriteCondition_Kind.
@@ -227,6 +228,7 @@ var (
 		8:  "IF_EXTENDED_TIME_ELAPSED",
 		9:  "IF_CHUNKS_EQUAL",
 		10: "IF_ENTRY_EQUAL",
+		11: "IF_OBJECT_EXISTS",
 	}
 	WriteCondition_Kind_value = map[string]int32{
 		"NONE":                     0,
@@ -240,6 +242,7 @@ var (
 		"IF_EXTENDED_TIME_ELAPSED": 8,
 		"IF_CHUNKS_EQUAL":          9,
 		"IF_ENTRY_EQUAL":           10,
+		"IF_OBJECT_EXISTS":         11,
 	}
 )
 
@@ -1395,7 +1398,9 @@ type CreateEntryRequest struct {
 	Condition *WriteCondition `protobuf:"bytes,7,opt,name=condition,proto3" json:"condition,omitempty"`
 	// Set on a create a filer forwarded to the entry's ring owner, so the owner
 	// applies it locally instead of forwarding again. Clients leave it unset.
-	IsMoved       bool `protobuf:"varint,8,opt,name=is_moved,json=isMoved,proto3" json:"is_moved,omitempty"`
+	IsMoved bool `protobuf:"varint,8,opt,name=is_moved,json=isMoved,proto3" json:"is_moved,omitempty"`
+	// The store write must be durable before the reply, as for ?fsync=true.
+	Fsync         bool `protobuf:"varint,9,opt,name=fsync,proto3" json:"fsync,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1482,6 +1487,13 @@ func (x *CreateEntryRequest) GetCondition() *WriteCondition {
 func (x *CreateEntryRequest) GetIsMoved() bool {
 	if x != nil {
 		return x.IsMoved
+	}
+	return false
+}
+
+func (x *CreateEntryRequest) GetFsync() bool {
+	if x != nil {
+		return x.Fsync
 	}
 	return false
 }
@@ -7489,7 +7501,7 @@ const file_filer_proto_rawDesc = "" +
 	"\bctime_ns\x18\x14 \x01(\x05R\actimeNs\x12\x1b\n" +
 	"\tcrtime_ns\x18\x15 \x01(\x05R\bcrtimeNs\x12\x14\n" +
 	"\x05atime\x18\x16 \x01(\x03R\x05atime\x12\x19\n" +
-	"\batime_ns\x18\x17 \x01(\x05R\aatimeNs\"\xd5\x02\n" +
+	"\batime_ns\x18\x17 \x01(\x05R\aatimeNs\"\xeb\x02\n" +
 	"\x12CreateEntryRequest\x12\x1c\n" +
 	"\tdirectory\x18\x01 \x01(\tR\tdirectory\x12%\n" +
 	"\x05entry\x18\x02 \x01(\v2\x0f.filer_pb.EntryR\x05entry\x12\x15\n" +
@@ -7500,7 +7512,8 @@ const file_filer_proto_rawDesc = "" +
 	"signatures\x12=\n" +
 	"\x1bskip_check_parent_directory\x18\x06 \x01(\bR\x18skipCheckParentDirectory\x126\n" +
 	"\tcondition\x18\a \x01(\v2\x18.filer_pb.WriteConditionR\tcondition\x12\x19\n" +
-	"\bis_moved\x18\b \x01(\bR\aisMoved\"\x88\x05\n" +
+	"\bis_moved\x18\b \x01(\bR\aisMoved\x12\x14\n" +
+	"\x05fsync\x18\t \x01(\bR\x05fsync\"\x9e\x05\n" +
 	"\x0eWriteCondition\x129\n" +
 	"\aclauses\x18\x01 \x03(\v2\x1f.filer_pb.WriteCondition.ClauseR\aclauses\x1a\xc9\x02\n" +
 	"\x06Clause\x121\n" +
@@ -7516,7 +7529,7 @@ const file_filer_proto_rawDesc = "" +
 	"gate_value\x18\b \x01(\tR\tgateValue\x12\x12\n" +
 	"\x04fids\x18\t \x03(\tR\x04fids\x126\n" +
 	"\x0eexpected_entry\x18\n" +
-	" \x01(\v2\x0f.filer_pb.EntryR\rexpectedEntry\"\xee\x01\n" +
+	" \x01(\v2\x0f.filer_pb.EntryR\rexpectedEntry\"\x84\x02\n" +
 	"\x04Kind\x12\b\n" +
 	"\x04NONE\x10\x00\x12\x11\n" +
 	"\rIF_NOT_EXISTS\x10\x01\x12\r\n" +
@@ -7529,7 +7542,8 @@ const file_filer_proto_rawDesc = "" +
 	"\x18IF_EXTENDED_TIME_ELAPSED\x10\b\x12\x13\n" +
 	"\x0fIF_CHUNKS_EQUAL\x10\t\x12\x12\n" +
 	"\x0eIF_ENTRY_EQUAL\x10\n" +
-	"\"\xad\x06\n" +
+	"\x12\x14\n" +
+	"\x10IF_OBJECT_EXISTS\x10\v\"\xad\x06\n" +
 	"\x0eObjectMutation\x121\n" +
 	"\x04type\x18\x01 \x01(\x0e2\x1d.filer_pb.ObjectMutation.TypeR\x04type\x12\x1c\n" +
 	"\tdirectory\x18\x02 \x01(\tR\tdirectory\x12\x12\n" +
