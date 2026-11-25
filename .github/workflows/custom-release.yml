@@ -1,0 +1,106 @@
+# Builds the filer.backup image this fork exists for: weed built from
+# `patched` on the upstream runtime image of the same release, published as
+# ghcr.io/bierdav/seaweedfs-backup:<release>-custom.<run>. Pull requests into
+# `patched` (fork-kit's sync PR included) run the same tests and build, and
+# publish nothing. See docs/custom-fork.md.
+name: Custom release
+
+on:
+  push:
+    branches: [patched]
+  pull_request:
+    branches: [patched]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: custom-release-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/bierdav/seaweedfs-backup
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: Test the fork's patches
+        run: |
+          set -euo pipefail
+          go test ./weed/replication/sink/localsink -count=1
+          go test ./weed/command -run 'TestBackup|TestEventSourceSuperseded|TestIsIgnorable404|TestMetadataProcessor' -count=1
+
+  build:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Find the upstream release
+        id: release
+        run: |
+          set -euo pipefail
+          git fetch -q --no-tags https://github.com/seaweedfs/seaweedfs.git '+refs/tags/*:refs/tags/*'
+          version=$(git tag --merged HEAD --sort=-v:refname | grep -E '^[0-9]+\.[0-9]+$' | head -n 1 || true)
+          [[ -n "$version" ]] || { echo "::error::No upstream release is merged into HEAD."; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$version-custom.$GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "Upstream release $version"
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: Build weed
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse --short=9 HEAD)-custom"
+          go build -trimpath -ldflags "-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$commit" -o "$RUNNER_TEMP/image/weed" ./weed
+      # The backup runs only on amd64 nodes.
+      - name: Build the image on the upstream runtime
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/image"
+          printf '%s\n' "FROM chrislusf/seaweedfs:$VERSION" 'COPY weed /usr/bin/weed' > Dockerfile
+          docker build --platform linux/amd64 \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            -t "$IMAGE:build" .
+          docker run --rm --entrypoint /usr/bin/weed "$IMAGE:build" version | tee version.txt
+          grep -qw -- "$VERSION" version.txt
+          grep -q -- "-custom linux amd64" version.txt
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env:
+          TOKEN: ${{ github.token }}
+      - name: Publish
+        if: github.event_name != 'pull_request'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker tag "$IMAGE:build" "$IMAGE:$TAG"
+          docker push "$IMAGE:$TAG"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$TAG")
+          echo "Published \`$IMAGE:$TAG\` (\`${digest#*@}\`)" | tee -a "$GITHUB_STEP_SUMMARY"

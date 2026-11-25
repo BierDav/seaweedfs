@@ -1,0 +1,32 @@
+# fork-kit (https://github.com/BierDav/fork-kit) keeps this fork merged with
+# upstream through one sync pull request. See docs/custom-fork.md.
+
+[upstream]
+url = "https://github.com/seaweedfs/seaweedfs.git"
+# The newest SeaweedFS release (4.55); the image runs on its runtime image.
+track = "release"
+
+[fork]
+branch = "patched"
+
+[ledger]
+ignore = [".github/**", "docs/custom-fork.md"]
+
+[[patch]]
+id = "directory-update"
+summary = "localsink: ignore directory metadata updates, so a delete/create fallback cannot remove a directory a concurrent copy just created"
+paths = [
+  "weed/replication/sink/localsink/local_sink.go",
+  "weed/replication/sink/localsink/local_sink_directory_update_test.go",
+]
+tests = ["go test ./weed/replication/sink/localsink"]
+
+[[patch]]
+id = "superseded-updates"
+summary = "filer.backup: skip superseded in-place file updates instead of copying a growing upload again and again"
+paths = [
+  "weed/command/filer_backup.go",
+  "weed/command/filer_backup_live_updates.go",
+  "weed/command/filer_backup_superseded_update_test.go",
+]
+tests = ["go test ./weed/command -run 'TestBackup|TestEventSourceSuperseded|TestIsIgnorable404|TestMetadataProcessor'"]
