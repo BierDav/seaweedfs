@@ -80,6 +80,7 @@ type Filer struct {
 	RemoteStorage                 *FilerRemoteStorage
 	BuildGuardedRemoteClient      RemoteStorageClientBuilder
 	AllowUntrustedRemoteEndpoints bool
+	webhooks                      managedWebhooks
 	lazyFetchGroup                singleflight.Group
 	lazyListGroup                 singleflight.Group
 	Dlm                           *lock_manager.DistributedLockManager
@@ -88,6 +89,8 @@ type Filer struct {
 	DeletionRetryQueue            *DeletionRetryQueue
 	EmptyFolderCleaner            *empty_folder_cleanup.EmptyFolderCleaner
 	EmptyFolderCleanupDelay       time.Duration
+	manifestRetryOnce             sync.Once
+	manifestRetryQueue            *DeletionRetryQueue
 	persistedLogCache             *persistedLogCache
 	metaLogInflight               metaLogInflight
 	remoteTombstones              *remoteDeletionTombstones
@@ -96,6 +99,10 @@ type Filer struct {
 	// aggregator across a replayed peer change's check-and-apply, so the two
 	// cannot interleave on the same path.
 	EntryLockTable *util.LockTable[util.FullPath]
+	// directoryCreateLock covers a directory row's re-check and insert, so a
+	// missing parent filled in by a nested create cannot replace a directory
+	// created at the same time.
+	directoryCreateLock *util.LockTable[util.FullPath]
 	// remoteTombstonesDone, when non-nil, is closed once the startup tombstone
 	// rebuild finishes; lazy remote reads wait on it so a pending delete
 	// cannot resurrect in the gap.
@@ -106,9 +113,11 @@ type Filer struct {
 	// to the store so a restart does not leak chunks. Guarded by
 	// deletionLedgerLock; nil-safe for Filer literals in tests.
 	// pendingDeletions maps each id to its enqueue epoch so an expiry-forget
-	// cannot erase a re-queued id.
+	// cannot erase a re-queued id. fsyncDeletions marks pending ids whose
+	// volume deletes must be durable.
 	deletionLedgerLock  sync.Mutex
 	pendingDeletions    map[string]uint64
+	fsyncDeletions      map[string]struct{}
 	deletionSeq         uint64
 	deletionLedgerDirty bool
 	deletionLedgerParts int
@@ -149,6 +158,7 @@ func NewFiler(masters pb.ServerDiscovery, dialOptions *DialOptions, filerHost pb
 		persistedLogCache:   newPersistedLogCache(persistedLogCacheMaxBytes),
 		remoteTombstones:    newRemoteDeletionTombstones(),
 		EntryLockTable:      util.NewLockTable[util.FullPath](),
+		directoryCreateLock: util.NewLockTable[util.FullPath](),
 	}
 	f.flushCtx, f.flushCancel = context.WithCancel(context.Background())
 	if f.UniqueFilerId < 0 {
@@ -463,6 +473,26 @@ func (f *Filer) BeginTransaction(ctx context.Context) (context.Context, error) {
 	return context.WithValue(txCtx, storeTransactionKey{}, true), nil
 }
 
+// TransactionCovers reports whether ctx is inside a store transaction that
+// covers the writes to the entries at paths: the default store isolates its
+// transactions and holds those entries. Such writes show to no other reader
+// before the commit, and a refused commit leaves none of them behind.
+func (f *Filer) TransactionCovers(ctx context.Context, paths ...util.FullPath) bool {
+	if ctx.Value(storeTransactionKey{}) == nil {
+		return false
+	}
+	fsw, ok := f.Store.(*FilerStoreWrapper)
+	return ok && fsw.transactionCovers(paths...)
+}
+
+// OverwritesAtOnce reports whether an entry inserted at path replaces what is
+// stored there at once and whole: the default store says that its inserts do,
+// and it holds the entry.
+func (f *Filer) OverwritesAtOnce(path util.FullPath) bool {
+	fsw, ok := f.Store.(*FilerStoreWrapper)
+	return ok && fsw.overwritesAtOnce(path)
+}
+
 func (f *Filer) CommitTransaction(ctx context.Context) error {
 	return f.Store.CommitTransaction(ctx)
 }
@@ -521,6 +551,7 @@ func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, existing *Entry, 
 		entry.Attr.Atime = entryInitialAtime(entry.Attr)
 	}
 
+	unlockDirectory := func() {}
 	oldEntry := existing
 	if oldEntry == nil {
 		var findErr error
@@ -536,6 +567,13 @@ func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, existing *Entry, 
 			// A create cannot decide whether the path exists when the lookup
 			// itself failed; proceeding would upsert over it.
 			return fmt.Errorf("find entry %s: %w", entry.FullPath, findErr)
+		}
+		if oldEntry == nil && entry.IsDirectory() {
+			unlockDirectory = f.lockDirectoryCreate(ctx, entry.FullPath)
+			defer unlockDirectory()
+			if oldEntry, findErr = f.FindEntry(context.WithValue(ctx, lazyFetchContextKey{}, true), entry.FullPath); findErr != nil && !errors.Is(findErr, filer_pb.ErrNotFound) {
+				return fmt.Errorf("find entry %s: %w", entry.FullPath, findErr)
+			}
 		}
 	}
 
@@ -567,6 +605,7 @@ func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, existing *Entry, 
 			glog.ErrorfCtx(ctx, "insert entry %s: %v", entry.FullPath, err)
 			return fmt.Errorf("insert entry %s: %v", entry.FullPath, err)
 		}
+		unlockDirectory()
 
 		// Parents go after the entry: one checked first can be taken by the
 		// empty-folder cleaner before the entry lands, and nothing would look again.
@@ -588,6 +627,7 @@ func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, existing *Entry, 
 			stats.FilerObjectSizeBytesHistogram.Observe(float64(entry.Size()))
 		}
 	} else {
+		unlockDirectory()
 		if o_excl {
 			glog.V(3).InfofCtx(ctx, "EEXIST: entry %s already exists", entry.FullPath)
 			return fmt.Errorf("%s: %w", entry.FullPath, filer_pb.ErrEntryAlreadyExists)
@@ -632,6 +672,67 @@ func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, existing *Entry, 
 	glog.V(4).InfofCtx(ctx, "CreateEntry %s: created", entry.FullPath)
 
 	return nil
+}
+
+// ReplaceFileForRename stores a file renamed over an existing file at the
+// target's path with one store write, on a store whose insert replaces an
+// entry at once and whole (OverwritesAtOnce). Deleting the target first would
+// leave the path empty there for anyone reading it until the new entry lands.
+// Apart from that it does what CreateEntry does for a new entry: it refuses a
+// name the filer would not create, and it creates missing parents after the
+// write. The store drops the replaced entry's hard link, if it had one, after
+// the write.
+//
+// The target was a file when the rename looked it up. Another filer may have
+// turned it into a directory since, by creating a child under it, and writing
+// over that would strand its children; or it may have deleted the target's
+// directory. So the target is read again right before the write and a
+// directory is refused, as the lookup would have refused it. Such a store has
+// no conditional write: this leaves the window that a delete-first rename has
+// between its own read of the target and its delete.
+func (f *Filer) ReplaceFileForRename(ctx context.Context, entry *Entry, maxFilenameLength uint32) error {
+	ctx = f.syncWriteContext(ctx, entry.FullPath)
+	if entry.FullPath.IsLongerFileName(maxFilenameLength) {
+		return filer_pb.ErrEntryNameTooLong
+	}
+	if entry.FullPath.HasDotSegment() {
+		return fmt.Errorf("invalid path %s", entry.FullPath)
+	}
+	current, findErr := f.FindEntry(context.WithValue(ctx, lazyFetchContextKey{}, true), entry.FullPath)
+	if findErr != nil && !errors.Is(findErr, filer_pb.ErrNotFound) {
+		return fmt.Errorf("find entry %s: %w", entry.FullPath, findErr)
+	}
+	if current != nil && current.IsDirectory() {
+		return fmt.Errorf("%s: %w", entry.FullPath, filer_pb.ErrExistingIsDirectory)
+	}
+	if entry.Attr.Atime.IsZero() {
+		entry.Attr.Atime = entryInitialAtime(entry.Attr)
+	}
+	f.ensureEntryInode(entry)
+	if err := f.Store.InsertEntry(ctx, entry); err != nil {
+		glog.ErrorfCtx(ctx, "replace entry %s: %v", entry.FullPath, err)
+		return fmt.Errorf("replace entry %s: %w", entry.FullPath, err)
+	}
+	// as in CreateEntry, parents go after the entry
+	dirParts := strings.Split(string(entry.FullPath), "/")
+	if err := f.ensureParentDirectoryEntry(ctx, entry, dirParts, len(dirParts)-1, false); err != nil {
+		glog.ErrorfCtx(ctx, "create parent directories of %s: %v", entry.FullPath, err)
+		return err
+	}
+	stats.FilerObjectSizeBytesHistogram.Observe(float64(entry.Size()))
+	return nil
+}
+
+// lockDirectoryCreate holds the path's directoryCreateLock; the returned
+// unlock may be called more than once. A store transaction keeps its
+// connection until it commits, and a holder may need that connection, so
+// writes inside one do not take the lock.
+func (f *Filer) lockDirectoryCreate(ctx context.Context, p util.FullPath) (unlock func()) {
+	if f.directoryCreateLock == nil || ctx.Value(storeTransactionKey{}) != nil {
+		return func() {}
+	}
+	lock := f.directoryCreateLock.AcquireLock("createDirectory", p, util.ExclusiveLock)
+	return sync.OnceFunc(func() { f.directoryCreateLock.ReleaseLock(p, lock) })
 }
 
 func (f *Filer) ensureParentDirectoryEntry(ctx context.Context, entry *Entry, dirParts []string, level int, isFromOtherCluster bool) (err error) {
@@ -690,17 +791,29 @@ func (f *Filer) ensureParentDirectoryEntry(ctx context.Context, entry *Entry, di
 		}
 
 		glog.V(2).InfofCtx(ctx, "create directory: %s %v", dirPath, dirEntry.Mode)
+		unlock := f.lockDirectoryCreate(ctx, dirEntry.FullPath)
+		if current, findErr := f.FindEntry(context.WithValue(ctx, lazyFetchContextKey{}, true), dirEntry.FullPath); current != nil || (findErr != nil && !errors.Is(findErr, filer_pb.ErrNotFound)) {
+			unlock()
+			if current == nil {
+				return findErr
+			}
+			// Created since the lookup above: take it as found.
+			return f.ensureParentDirectoryEntry(ctx, entry, dirParts, level, isFromOtherCluster)
+		}
 		f.stampEntryCommitTsNs(dirEntry)
 		mkdirErr := f.Store.InsertEntry(ctx, dirEntry)
+		unlock()
 		if mkdirErr != nil {
 			f.releaseEntryCommitTsNs(dirEntry.CommitTsNs)
 			if fEntry, err := f.FindEntry(ctx, util.FullPath(dirPath)); err == filer_pb.ErrNotFound || fEntry == nil {
 				glog.V(3).InfofCtx(ctx, "mkdir %s: %v", dirPath, mkdirErr)
 				return fmt.Errorf("mkdir %s: %v", dirPath, mkdirErr)
 			}
-		} else if !strings.HasPrefix("/"+util.Join(dirParts[:]...), SystemLogDir) {
+		} else if !metadataEventsSuppressed(ctx) && !strings.HasPrefix("/"+util.Join(dirParts[:]...), SystemLogDir) {
 			f.NotifyUpdateEvent(ctx, nil, dirEntry, false, isFromOtherCluster, nil)
-		} else {
+		} else if !recordCreatedParent(ctx, dirEntry) {
+			// No event adopts this stamp: a suppressing caller covers only its
+			// own entry, unless it collects the parents created on the way.
 			f.releaseEntryCommitTsNs(dirEntry.CommitTsNs)
 		}
 
@@ -726,7 +839,13 @@ func (f *Filer) ensureParentDirectoryEntry(ctx context.Context, entry *Entry, di
 			f.releaseEntryCommitTsNs(dirEntry.CommitTsNs)
 			return fmt.Errorf("promote %s to directory: %v", dirPath, updateErr)
 		}
-		f.NotifyUpdateEvent(ctx, nil, dirEntry, false, isFromOtherCluster, nil)
+		if metadataEventsSuppressed(ctx) {
+			if !recordCreatedParent(ctx, dirEntry) {
+				f.releaseEntryCommitTsNs(dirEntry.CommitTsNs)
+			}
+		} else {
+			f.NotifyUpdateEvent(ctx, nil, dirEntry, false, isFromOtherCluster, nil)
+		}
 	}
 
 	return nil

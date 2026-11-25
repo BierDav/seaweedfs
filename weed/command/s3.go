@@ -20,10 +20,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
-	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_lifecycle_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_pb"
-	"github.com/seaweedfs/seaweedfs/weed/pb/vector_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/iceberg"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/lance"
@@ -37,8 +35,6 @@ import (
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"github.com/seaweedfs/seaweedfs/weed/util/version"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 var (
@@ -50,6 +46,7 @@ var (
 // When adding a new field, update all four flag registration sites.
 type S3Options struct {
 	filer                     *string
+	homeFiler                 string // set by an embedding command to its own filer; not a flag
 	ip                        *string
 	bindIp                    *string
 	listenOnLocalhost         *bool
@@ -79,6 +76,7 @@ type S3Options struct {
 	idleTimeout               *int
 	concurrentUploadLimitMB   *int
 	concurrentFileUploadLimit *int
+	inflightUploadDataTimeout *time.Duration
 	enableIam                 *bool
 	iamReadOnly               *bool
 	debug                     *bool
@@ -92,6 +90,10 @@ type S3Options struct {
 	allowUntrustedRemoteEndpoints *bool
 	allowBackslashInKey           *bool
 	iamSelfServiceRequiresGrant   *bool
+	preStopSeconds                *int
+	routedLookupTimeout           *time.Duration
+	unreachableOwnerTTL           *time.Duration
+	volumeLookupTimeout           *time.Duration
 	// shutdownCtx, when non-nil, tells startS3Server to gracefully shut down
 	// its HTTP/gRPC servers once the ctx is cancelled, in addition to on
 	// interrupt. Used by weed mini to orchestrate an ordered shutdown.
@@ -139,6 +141,7 @@ func init() {
 	s3StandaloneOptions.idleTimeout = cmdS3.Flag.Int("idleTimeout", 120, "connection idle seconds")
 	s3StandaloneOptions.concurrentUploadLimitMB = cmdS3.Flag.Int("concurrentUploadLimitMB", 0, "limit total concurrent upload size, 0 means unlimited")
 	s3StandaloneOptions.concurrentFileUploadLimit = cmdS3.Flag.Int("concurrentFileUploadLimit", 0, "limit number of concurrent file uploads, 0 means unlimited")
+	s3StandaloneOptions.inflightUploadDataTimeout = cmdS3.Flag.Duration("inflightUploadDataTimeout", 60*time.Second, "how long an upload waits for a slot under the concurrent upload limits before it is rejected with SlowDown, 0 means no limit")
 	s3StandaloneOptions.enableIam = cmdS3.Flag.Bool("iam", true, "enable embedded IAM API on the same port")
 	s3StandaloneOptions.iamReadOnly = cmdS3.Flag.Bool("iam.readOnly", true, "disable IAM write operations on this server")
 	s3StandaloneOptions.debug = cmdS3.Flag.Bool("debug", false, "serves runtime profiling data via pprof on the port specified by -debug.port")
@@ -151,6 +154,10 @@ func init() {
 	s3StandaloneOptions.allowUntrustedRemoteEndpoints = cmdS3.Flag.Bool("allowUntrustedRemoteEndpoints", false, allowUntrustedRemoteEndpointsUsage)
 	s3StandaloneOptions.allowBackslashInKey = cmdS3.Flag.Bool("allowBackslashInKey", false, allowBackslashInKeyUsage)
 	s3StandaloneOptions.iamSelfServiceRequiresGrant = cmdS3.Flag.Bool("iam.selfServiceRequiresGrant", false, iamSelfServiceRequiresGrantUsage)
+	s3StandaloneOptions.preStopSeconds = cmdS3.Flag.Int("preStopSeconds", 0, s3PreStopSecondsUsage)
+	s3StandaloneOptions.routedLookupTimeout = cmdS3.Flag.Duration("routedLookupTimeout", defaultS3RoutedLookupTimeout, s3RoutedLookupTimeoutUsage)
+	s3StandaloneOptions.unreachableOwnerTTL = cmdS3.Flag.Duration("unreachableOwnerTTL", defaultS3UnreachableOwnerTTL, s3UnreachableOwnerTTLUsage)
+	s3StandaloneOptions.volumeLookupTimeout = cmdS3.Flag.Duration("volumeLookupTimeout", defaultS3VolumeLookupTimeout, s3VolumeLookupTimeoutUsage)
 }
 
 var cmdS3 = &Command{
@@ -392,6 +399,7 @@ func (s3opt *S3Options) startS3Server() bool {
 
 	s3ApiServer, s3ApiServer_err = s3api.NewS3ApiServer(router, &s3api.S3ApiServerOption{
 		Filers:                    filerAddresses,
+		HomeFiler:                 pb.ServerAddress(s3opt.homeFiler),
 		Masters:                   masterAddresses,
 		Port:                      *s3opt.port,
 		Config:                    *s3opt.config,
@@ -407,6 +415,7 @@ func (s3opt *S3Options) startS3Server() bool {
 		IamConfig:                 iamConfigPath, // Advanced IAM config (optional)
 		ConcurrentUploadLimit:     int64(*s3opt.concurrentUploadLimitMB) * 1024 * 1024,
 		ConcurrentFileUploadLimit: int64(*s3opt.concurrentFileUploadLimit),
+		InflightUploadDataTimeout: *s3opt.inflightUploadDataTimeout,
 		EnableIam:                 *s3opt.enableIam, // Embedded IAM API (enabled by default)
 		IamReadOnly:               *s3opt.iamReadOnly,
 		Cipher:                    *s3opt.cipher || filerCipher, // encrypt data on volume servers
@@ -422,6 +431,9 @@ func (s3opt *S3Options) startS3Server() bool {
 		AllowUntrustedRemoteEndpoints: *s3opt.allowUntrustedRemoteEndpoints,
 		AllowBackslashInKey:           *s3opt.allowBackslashInKey,
 		IamSelfServiceRequiresGrant:   *s3opt.iamSelfServiceRequiresGrant,
+		RoutedLookupTimeout:           *s3opt.routedLookupTimeout,
+		UnreachableOwnerTTL:           *s3opt.unreachableOwnerTTL,
+		VolumeLookupTimeout:           *s3opt.volumeLookupTimeout,
 	})
 	if s3ApiServer_err != nil {
 		glog.Fatalf("S3 API Server startup error: %v", s3ApiServer_err)
@@ -451,17 +463,7 @@ func (s3opt *S3Options) startS3Server() bool {
 	// The Vectors API rides the main -port listener whenever a weed-vector
 	// backend is reachable — /s3vectors/ in the SigV4 credential scope picks
 	// the vectors router.
-	vectorsHandler := http.Handler(router)
-	if vectorsRouter := s3opt.vectorsRouter(s3ApiServer, grpcDialOption, masterAddresses); vectorsRouter != nil {
-		vr, mainRouter := vectorsRouter, router
-		vectorsHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if isVectorsRequest(r) {
-				vr.ServeHTTP(w, r)
-				return
-			}
-			mainRouter.ServeHTTP(w, r)
-		})
-	}
+	vectorsHandler := s3Handler(router, s3opt.vectorsRouter(s3ApiServer, grpcDialOption, masterAddresses, filerGroup))
 
 	if runtime.GOOS != "windows" {
 		localSocket := *s3opt.localSocket
@@ -614,14 +616,45 @@ func (s3opt *S3Options) startS3Server() bool {
 
 func (s3opt *S3Options) newShutdown(stopGrpc func(), s3ApiServer *s3api.S3ApiServer, httpServers []*http.Server) func() {
 	shutdown := newGracefulShutdown(stopGrpc, s3ApiServer.Shutdown, httpServers...)
-	grace.OnInterrupt(shutdown)
+	var cancelled <-chan struct{}
 	if s3opt.shutdownCtx != nil {
+		cancelled = s3opt.shutdownCtx.Done()
 		go func() {
-			<-s3opt.shutdownCtx.Done()
+			<-cancelled
 			shutdown()
 		}()
 	}
+	preStop := sync.OnceFunc(preStopWait(s3ApiServer.StartDraining, s3opt.preStopDelay(), cancelled))
+	// The wait has to finish before weed mini cancels shutdownCtx, and before
+	// weed server shuts down the filer and volume server, whose hooks may be
+	// registered after this one.
+	beforeMiniClientsShutdown(preStop)
+	grace.OnInterruptFirst(preStop)
+	grace.OnInterrupt(shutdown)
 	return shutdown
+}
+
+func (s3opt *S3Options) preStopDelay() time.Duration {
+	if s3opt.preStopSeconds == nil || *s3opt.preStopSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(*s3opt.preStopSeconds) * time.Second
+}
+
+func preStopWait(startDraining func(), delay time.Duration, cancelled <-chan struct{}) func() {
+	return func() {
+		if delay <= 0 {
+			return
+		}
+		startDraining()
+		glog.V(0).Infof("S3 API Server failing health checks for %s before shutdown", delay)
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-cancelled:
+		}
+	}
 }
 
 // vendsCredentials reports whether -iceberg.credentialRole is set, which
@@ -736,15 +769,15 @@ func (s3opt *S3Options) startLanceServer(listenOnLocalhost bool) *http.Server {
 	return httpS
 }
 
-// vectorsRouter builds the S3 Vectors API router — workers register to the
-// master and the backend resolves them lazily, so a worker that comes up
-// after the gateway still gets picked up on first query.
-func (s3opt *S3Options) vectorsRouter(s3ApiServer *s3api.S3ApiServer, grpcDialOption grpc.DialOption, masterAddresses []pb.ServerAddress) *mux.Router {
+// vectorsRouter builds the S3 Vectors API router — weed-vector servers
+// register to the master and the backend resolves them lazily, so a server
+// that comes up after the gateway still gets picked up on first query.
+func (s3opt *S3Options) vectorsRouter(s3ApiServer *s3api.S3ApiServer, grpcDialOption grpc.DialOption, masterAddresses []pb.ServerAddress, filerGroup string) *mux.Router {
 	if len(masterAddresses) == 0 {
 		glog.Warningf("S3 Vectors API disabled: no weed-vector registered on master")
 		return nil
 	}
-	backend := &vectorDiscovery{masters: masterAddresses, grpcDialOption: grpcDialOption, discover: discoverVectorWorkers}
+	backend := s3vectors.NewVectorDiscovery(func() []pb.ServerAddress { return masterAddresses }, grpcDialOption, filerGroup)
 	// In-process describe — the router resolves locations and vended
 	// storage options through the catalog directly, never over HTTP. The
 	// lookup itself runs under the trusted identity: the caller's vector
@@ -764,232 +797,27 @@ func (s3opt *S3Options) vectorsRouter(s3ApiServer *s3api.S3ApiServer, grpcDialOp
 	vectorsServer.SetAccountID(s3tables.DefaultAccountID)
 	vectorsServer.SetEncryptionChecker(s3api.GetSSES3KeyManager().IsConfigured)
 	vectorsServer.SetDescribe(describe)
+	vectorsServer.SetLimiter(s3ApiServer.Limit)
+	vectorsServer.SetRequestLimits(int64(*s3opt.concurrentFileUploadLimit), int64(*s3opt.concurrentUploadLimitMB)*1024*1024)
 	vectorsServer.RegisterRoutes(vectorsRouter)
 	return vectorsRouter
 }
 
-// vectorDiscovery resolves the currently registered weed-vector through the
-// master and caches the connection; workers joining after gateway startup
-// are picked up on first query.
-type vectorDiscovery struct {
-	masters        []pb.ServerAddress
-	grpcDialOption grpc.DialOption
-	discover       func([]pb.ServerAddress, grpc.DialOption) []string
-	mu             sync.Mutex
-	worker         string
-	conn           *grpc.ClientConn
-	client         vector_pb.VectorServiceClient
-	nextResolve    time.Time
-	resolving      chan struct{} // closed when the in-flight resolve lands
-}
-
-// reset drops the cached worker so the next call rediscovers — invoked on
-// transport errors only, and only when the failed client is still the
-// cached one (a concurrent request may have already re-resolved).
-func (d *vectorDiscovery) reset(c vector_pb.VectorServiceClient) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if c != d.client {
-		return
+// s3Handler serves router, and vectors for Vectors API requests when set. mux
+// matches Queries() before router middleware runs, so the escape wraps the
+// router for routing and authorization to read one query.
+func s3Handler(router, vectors *mux.Router) http.Handler {
+	main := util_http.EscapeSemicolonsInQuery(router)
+	if vectors == nil {
+		return main
 	}
-	if d.conn != nil {
-		d.conn.Close()
-	}
-	d.worker, d.conn, d.client = "", nil, nil
-	d.nextResolve = time.Time{}
-}
-
-// Only Unavailable proves a transport failure — a request deadline or an
-// application-level error can fire on a healthy connection.
-func isTransportError(err error) bool {
-	return status.Code(err) == codes.Unavailable
-}
-
-// resolve runs without d.mu held so a slow master cannot stall cached-client callers.
-func (d *vectorDiscovery) resolve() {
-	workers := d.discover(d.masters, d.grpcDialOption)
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	// Measured from lookup end so a slow lookup cannot leave the next one already due.
-	defer func() {
-		interval := vectorRecheckInterval
-		if d.client != nil {
-			interval = vectorResolveInterval
-		}
-		d.nextResolve = time.Now().Add(interval)
-		close(d.resolving)
-		d.resolving = nil
-	}()
-	if len(workers) == 0 {
-		return
-	}
-	worker := workers[0]
-	for _, w := range workers {
-		if w == d.worker {
-			worker = w
-			break
-		}
-	}
-	if worker != d.worker {
-		conn, err := pb.GrpcDial(context.Background(), worker, false, d.grpcDialOption)
-		if err != nil {
-			glog.Warningf("S3 Vectors: dial weed-vector %s: %v", worker, err)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isVectorsRequest(r) {
+			vectors.ServeHTTP(w, r)
 			return
 		}
-		if d.conn != nil {
-			d.conn.Close()
-		}
-		d.worker, d.conn = worker, conn
-		d.client = vector_pb.NewVectorServiceClient(conn)
-	}
-}
-
-// A live client refreshes membership at most every vectorResolveInterval.
-// With no usable backend the recheck is much more frequent: a worker that
-// registers a moment after a lookup must surface inside a caller's retry
-// budget, while an absent one still cannot flood the master with lookups.
-const (
-	vectorResolveInterval = 5 * time.Second
-	vectorRecheckInterval = 500 * time.Millisecond
-)
-
-var errNoVectorWorker = status.Error(codes.Unavailable, "no weed-vector registered on master")
-
-func (d *vectorDiscovery) cli() (vector_pb.VectorServiceClient, error) {
-	d.mu.Lock()
-	if d.resolving == nil && !time.Now().Before(d.nextResolve) {
-		d.resolving = make(chan struct{})
-		go d.resolve()
-	}
-	cli, resolving := d.client, d.resolving
-	d.mu.Unlock()
-	if cli != nil {
-		return cli, nil
-	}
-	// No cached client: wait for the in-flight lookup instead of failing.
-	if resolving != nil {
-		<-resolving
-		d.mu.Lock()
-		cli = d.client
-		d.mu.Unlock()
-		if cli != nil {
-			return cli, nil
-		}
-	}
-	return nil, errNoVectorWorker
-}
-
-func (d *vectorDiscovery) CreateIndex(ctx context.Context, in *vector_pb.CreateIndexRequest, opts ...grpc.CallOption) (resp *vector_pb.CreateIndexResponse, err error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		var c vector_pb.VectorServiceClient
-		if c, err = d.cli(); err != nil {
-			return nil, err
-		}
-		if resp, err = c.CreateIndex(ctx, in, opts...); err == nil {
-			return resp, nil
-		}
-		if !isTransportError(err) {
-			return nil, err
-		}
-		d.reset(c)
-	}
-	return nil, err
-}
-func (d *vectorDiscovery) DropIndex(ctx context.Context, in *vector_pb.DropIndexRequest, opts ...grpc.CallOption) (resp *vector_pb.DropIndexResponse, err error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		var c vector_pb.VectorServiceClient
-		if c, err = d.cli(); err != nil {
-			return nil, err
-		}
-		if resp, err = c.DropIndex(ctx, in, opts...); err == nil {
-			return resp, nil
-		}
-		if !isTransportError(err) {
-			return nil, err
-		}
-		d.reset(c)
-	}
-	return nil, err
-}
-func (d *vectorDiscovery) PutVectors(ctx context.Context, in *vector_pb.PutVectorsRequest, opts ...grpc.CallOption) (resp *vector_pb.PutVectorsResponse, err error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		var c vector_pb.VectorServiceClient
-		if c, err = d.cli(); err != nil {
-			return nil, err
-		}
-		if resp, err = c.PutVectors(ctx, in, opts...); err == nil {
-			return resp, nil
-		}
-		if !isTransportError(err) {
-			return nil, err
-		}
-		d.reset(c)
-	}
-	return nil, err
-}
-func (d *vectorDiscovery) GetVectors(ctx context.Context, in *vector_pb.GetVectorsRequest, opts ...grpc.CallOption) (resp *vector_pb.GetVectorsResponse, err error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		var c vector_pb.VectorServiceClient
-		if c, err = d.cli(); err != nil {
-			return nil, err
-		}
-		if resp, err = c.GetVectors(ctx, in, opts...); err == nil {
-			return resp, nil
-		}
-		if !isTransportError(err) {
-			return nil, err
-		}
-		d.reset(c)
-	}
-	return nil, err
-}
-func (d *vectorDiscovery) DeleteVectors(ctx context.Context, in *vector_pb.DeleteVectorsRequest, opts ...grpc.CallOption) (resp *vector_pb.DeleteVectorsResponse, err error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		var c vector_pb.VectorServiceClient
-		if c, err = d.cli(); err != nil {
-			return nil, err
-		}
-		if resp, err = c.DeleteVectors(ctx, in, opts...); err == nil {
-			return resp, nil
-		}
-		if !isTransportError(err) {
-			return nil, err
-		}
-		d.reset(c)
-	}
-	return nil, err
-}
-func (d *vectorDiscovery) ListVectors(ctx context.Context, in *vector_pb.ListVectorsRequest, opts ...grpc.CallOption) (resp *vector_pb.ListVectorsResponse, err error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		var c vector_pb.VectorServiceClient
-		if c, err = d.cli(); err != nil {
-			return nil, err
-		}
-		if resp, err = c.ListVectors(ctx, in, opts...); err == nil {
-			return resp, nil
-		}
-		if !isTransportError(err) {
-			return nil, err
-		}
-		d.reset(c)
-	}
-	return nil, err
-}
-func (d *vectorDiscovery) QueryVectors(ctx context.Context, in *vector_pb.QueryVectorsRequest, opts ...grpc.CallOption) (resp *vector_pb.QueryVectorsResponse, err error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		var c vector_pb.VectorServiceClient
-		if c, err = d.cli(); err != nil {
-			return nil, err
-		}
-		if resp, err = c.QueryVectors(ctx, in, opts...); err == nil {
-			return resp, nil
-		}
-		if !isTransportError(err) {
-			return nil, err
-		}
-		d.reset(c)
-	}
-	return nil, err
+		main.ServeHTTP(w, r)
+	})
 }
 
 // isVectorsRequest routes by the SigV4 credential scope — the s3vectors
@@ -1125,40 +953,4 @@ func (v lanceCredentialVendor) VendTableCredentials(ctx context.Context, princip
 		SessionToken:    credentials.SessionToken,
 		Expiration:      credentials.Expiration,
 	}, nil
-}
-
-// discoverVectorWorker resolves one registered weed-vector server through the
-// master's cluster-nodes list; OSS fans every vector call to that single
-// backend.
-// discoverVectorWorkers returns every registered weed-vector address —
-// callers keep their current worker when it is still listed so
-// membership-order changes cannot churn live connections.
-func discoverVectorWorkers(masters []pb.ServerAddress, grpcDialOption grpc.DialOption) []string {
-	for _, master := range masters {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		conn, err := pb.GrpcDial(ctx, master.ToGrpcAddress(), false, grpcDialOption)
-		if err != nil {
-			cancel()
-			continue
-		}
-		resp, err := master_pb.NewSeaweedClient(conn).ListClusterNodes(ctx, &master_pb.ListClusterNodesRequest{
-			ClientType: "vector",
-		})
-		conn.Close()
-		cancel()
-		if err != nil {
-			continue
-		}
-		workers := make([]string, 0, len(resp.ClusterNodes))
-		for _, node := range resp.ClusterNodes {
-			glog.V(0).Infof("S3 Vectors: discovered weed-vector at %s via master %s", node.Address, master)
-			workers = append(workers, node.Address)
-		}
-		// A follower can answer with an empty list — workers register with
-		// the leader, so keep looking rather than accept "none."
-		if len(workers) > 0 {
-			return workers
-		}
-	}
-	return nil
 }

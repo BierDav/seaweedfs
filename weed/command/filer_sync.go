@@ -495,6 +495,7 @@ func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, sourceGrpcDi
 		StartTsNs:              sourceFilerOffsetTsNs,
 		StopTsNs:               0,
 		EventErrorType:         pb.RetryForeverOnError,
+		FilerJwtProvider:       sourceJwtProvider,
 		GetResumeTsNs: func() int64 {
 			return resumeTsNsFor(processor)
 		},
@@ -681,6 +682,10 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 		if message.NewEntry != nil {
 			sourceNewKey = util.FullPath(targetDir).Child(message.NewEntry.Name)
 		}
+		mutationTsNs := resp.MutationTsNs
+		if mutationTsNs == 0 {
+			mutationTsNs = resp.TsNs
+		}
 
 		if debug {
 			glog.V(0).Infof("received %s ts_ns=%d", resp.Directory, resp.TsNs)
@@ -733,7 +738,7 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 				return nil
 			}
 			key := buildKey(dataSink, message, targetPath, sourceOldKey, sourcePath)
-			return sink.DeleteEntry(dataSink, key, message.OldEntry.IsDirectory, message.DeleteChunks, filer.IsMetadataOnlyDelete(message.OldEntry), message.Signatures)
+			return sink.DeleteEntryVersion(dataSink, key, message.OldEntry, mutationTsNs, message.DeleteChunks, filer.IsMetadataOnlyDelete(message.OldEntry), message.Signatures)
 		}
 
 		// handle new entries
@@ -775,7 +780,7 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 						if err := dataSink.CreateEntry(newKey, message.NewEntry, message.Signatures); err != nil {
 							return fmt.Errorf("create entry2 : %w", err)
 						}
-						if err := dataSink.DeleteEntry(oldKey, message.OldEntry.IsDirectory, false, message.Signatures); err != nil {
+						if err := sink.DeleteEntryVersion(dataSink, oldKey, message.OldEntry, mutationTsNs, false, false, message.Signatures); err != nil {
 							return fmt.Errorf("delete old entry %v: %w", oldKey, err)
 						}
 						return nil
@@ -817,7 +822,7 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 				// new key is outside the watched directory
 				if doDeleteFiles {
 					key := buildKey(dataSink, message, targetPath, sourceOldKey, sourcePath)
-					return dataSink.DeleteEntry(key, message.OldEntry.IsDirectory, message.DeleteChunks, message.Signatures)
+					return sink.DeleteEntryVersion(dataSink, key, message.OldEntry, mutationTsNs, message.DeleteChunks, false, message.Signatures)
 				}
 			}
 		} else {

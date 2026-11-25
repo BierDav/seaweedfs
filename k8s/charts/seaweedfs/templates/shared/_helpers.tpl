@@ -491,6 +491,25 @@ true
 {{- end -}}
 {{- end -}}
 
+{{/* True when the volume servers serve HTTPS. Their certificates come from
+     enableSecurity, so the option fails without it. */}}
+{{- define "seaweedfs.volumeHttps" -}}
+{{- if ((.Values.global.seaweedfs).volumeHttps).enabled -}}
+{{- if not .Values.global.seaweedfs.enableSecurity -}}
+{{- fail "global.seaweedfs.volumeHttps.enabled requires global.seaweedfs.enableSecurity, which provides the certificates" -}}
+{{- end -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* Pod annotation that restarts the readers of security.toml when volume
+     HTTPS is switched on or off. */}}
+{{- define "seaweedfs.volumeHttpsAnnotation" -}}
+{{- with include "seaweedfs.volumeHttps" . -}}
+checksum/volume-https: {{ sha256sum . | quote }}
+{{- end -}}
+{{- end -}}
+
 {{/* Read a JWT key from the chart's existing security.toml without fromToml
      (which requires Helm >=3.17). Args: (list "<section>" $raw).
      Return the single-line TOML string token, including its quotes, so escapes
@@ -769,4 +788,16 @@ on install.
 {{- define "seaweedfs.master.configChecksum" -}}
 {{- $context := merge (dict "Values" (omit .Values "commonLabels")) (omit . "Values") -}}
 {{- include (print .Template.BasePath "/master/master-configmap.yaml") $context | sha256sum -}}
+{{- end -}}
+
+{{- define "seaweedfs.vector.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "seaweedfs.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name | quote }}
+app.kubernetes.io/component: vector
+{{- end -}}
+{{- define "seaweedfs.vector.labels" -}}
+{{ include "seaweedfs.vector.selectorLabels" . }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+{{- with include "seaweedfs.commonLabels" . }}{{ . | nindent 0 }}{{ end }}
 {{- end -}}

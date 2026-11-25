@@ -813,11 +813,9 @@ func (t *Topology) ListCollections(includeNormalVolumes, includeEcVolumes bool) 
 	found := make(map[string]bool)
 
 	if includeNormalVolumes {
-		t.collectionMap.RLock()
 		for _, c := range t.collectionMap.Items() {
 			found[c.(*Collection).Name] = true
 		}
-		t.collectionMap.RUnlock()
 	}
 
 	if includeEcVolumes {
@@ -1086,10 +1084,7 @@ func volumeLayoutKey(collection string, rp *super_block.ReplicaPlacement, ttl *n
 }
 
 func ttlEqual(a, b *needle.TTL) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	return a.ToUint32() == b.ToUint32()
+	return a.String() == b.String()
 }
 
 // findDuplicateVolumeLayouts reports every layout that already holds v.Id on

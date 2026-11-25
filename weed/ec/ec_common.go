@@ -312,7 +312,7 @@ func OneServerCopyAndMountEcShardsFromSource(grpcDialOption grpc.DialOption,
 	fmt.Printf("allocate %d.%v %s => %s\n", volumeId, shardIdsToCopy, existingLocation, targetServer.Info.Id)
 
 	targetAddress := pb.NewServerAddressFromDataNode(targetServer.Info)
-	err = volume_move.NewMover(grpcDialOption).CopyAndMountEcShards(context.Background(), volumeId, collection, shardIdsToCopy, existingLocation, targetAddress, destDiskId, 0, os.Stdout)
+	err = volume_move.NewMover(grpcDialOption).CopyAndMountEcShards(context.Background(), volumeId, collection, shardIdsToCopy, existingLocation, targetAddress, destDiskId, "", 0, os.Stdout)
 	if err != nil {
 		return
 	}
@@ -1207,6 +1207,7 @@ func toBalancerTopology(ecNodes []*EcNode, collections []string, diskType types.
 				}
 				selected[eci.Id] = true
 				node.AddShards(eci.Id, eci.Collection, eci.DiskId, erasure_coding.ShardBits(eci.EcIndexBits))
+				node.SetEncodeTs(eci.Id, eci.Collection, eci.DiskId, eci.EncodeTsNs)
 				if d, p := ecbalancer.VolumeShardRatio(eci); d > 0 || p > 0 {
 					volRatios[volRatioKey{eci.Collection, eci.Id}] = [2]int{d, p}
 				}
@@ -1439,12 +1440,13 @@ func (ecb *ecBalancer) applyShardMoveRPC(src, dst *EcNode, collection string, vi
 		return nil
 	}
 	return volume_move.NewMover(ecb.env.GrpcDialOption).MoveEcShards(context.Background(), volume_move.EcShardMove{
-		VolumeId:   vid,
-		Collection: collection,
-		ShardIds:   []erasure_coding.ShardId{shardId},
-		Source:     srcAddr,
-		Target:     dstAddr,
-		TargetDisk: destDiskId,
+		VolumeId:       vid,
+		Collection:     collection,
+		ShardIds:       []erasure_coding.ShardId{shardId},
+		Source:         srcAddr,
+		Target:         dstAddr,
+		TargetDisk:     destDiskId,
+		TargetDiskType: ecb.diskType.String(),
 	}, volume_move.EcMoveOptions{IoBytePerSecond: ecb.ioBytePerSecond, Writer: os.Stdout})
 }
 

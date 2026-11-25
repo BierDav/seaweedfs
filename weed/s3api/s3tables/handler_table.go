@@ -501,6 +501,7 @@ func (h *S3TablesHandler) handleGetTable(w http.ResponseWriter, r *http.Request,
 		metadata.OwnerAccountID, tablePolicy, tableARN,
 		bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
 			TrustedIssuers:   h.trustedIssuers(r),
+			Subject:          callerSubject(r),
 			IsLocalAccountID: h.localAccountIDs,
 			TableBucketName:  bucketName,
 			Namespace:        namespace,
@@ -652,6 +653,7 @@ func (h *S3TablesHandler) handleListTables(w http.ResponseWriter, r *http.Reques
 				nsMeta.OwnerAccountID, namespacePolicy, bucketARN,
 				bucketMeta.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
 					TrustedIssuers:   h.trustedIssuers(r),
+					Subject:          callerSubject(r),
 					IsLocalAccountID: h.localAccountIDs,
 					TableBucketName:  bucketName,
 					Namespace:        namespaceName,
@@ -705,6 +707,7 @@ func (h *S3TablesHandler) handleListTables(w http.ResponseWriter, r *http.Reques
 			identityActions := getIdentityActions(r)
 			if !CheckPermissionWithContext("ListTables", accountID, bucketMeta.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
 				TrustedIssuers:   h.trustedIssuers(r),
+				Subject:          callerSubject(r),
 				IsLocalAccountID: h.localAccountIDs,
 				TableBucketName:  bucketName,
 				TableBucketTags:  bucketTags,
@@ -1059,6 +1062,7 @@ func (h *S3TablesHandler) handleDeleteTable(w http.ResponseWriter, r *http.Reque
 		metadata.OwnerAccountID, tablePolicy, tableARN,
 		bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
 			TrustedIssuers:   h.trustedIssuers(r),
+			Subject:          callerSubject(r),
 			IsLocalAccountID: h.localAccountIDs,
 			TableBucketName:  bucketName,
 			Namespace:        namespaceName,
@@ -1409,6 +1413,7 @@ func tablePurgeDir(entry *filer_pb.Entry, tablePath, bucketName string) (string,
 func (h *S3TablesHandler) canReadEntry(readOp, principal, tableOwner, bucketOwner, tablePolicy, bucketPolicy, tableARN, bucketARN, bucketName, namespace, name string, bucketTags, tableTags map[string]string, identityActions []string, r *http.Request) bool {
 	ctx := &PolicyContext{
 		TrustedIssuers:   h.trustedIssuers(r),
+		Subject:          callerSubject(r),
 		IsLocalAccountID: h.localAccountIDs,
 		TableBucketName:  bucketName,
 		Namespace:        namespace,
@@ -1617,6 +1622,7 @@ func (h *S3TablesHandler) renameCatalogEntry(w http.ResponseWriter, r *http.Requ
 		metadata.OwnerAccountID, tablePolicy, tableARN,
 		bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
 			TrustedIssuers:   h.trustedIssuers(r),
+			Subject:          callerSubject(r),
 			IsLocalAccountID: h.localAccountIDs,
 			TableBucketName:  bucketName,
 			Namespace:        srcNamespace,
@@ -1686,6 +1692,7 @@ func (h *S3TablesHandler) renameCatalogEntry(w http.ResponseWriter, r *http.Requ
 		destNamespaceMetadata.OwnerAccountID, destNamespacePolicy, bucketARN,
 		bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
 			TrustedIssuers:   h.trustedIssuers(r),
+			Subject:          callerSubject(r),
 			IsLocalAccountID: h.localAccountIDs,
 			TableBucketName:  bucketName,
 			Namespace:        destNamespace,
@@ -2004,7 +2011,9 @@ func (h *S3TablesHandler) authorizeUpdateTable(w http.ResponseWriter, r *http.Re
 		return nil, err
 	}
 
-	if err := ValidateMetadataLocation(req.MetadataLocation, bucketName, namespaceName); err != nil {
+	// Where the location may point depends on the stored record, so only its
+	// shape is checked here; the rest waits for authorization below.
+	if _, err := validateMetadataLocationShape(req.MetadataLocation, bucketName); err != nil {
 		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
 		return nil, err
 	}
@@ -2088,6 +2097,7 @@ func (h *S3TablesHandler) authorizeUpdateTable(w http.ResponseWriter, r *http.Re
 		metadata.OwnerAccountID, tablePolicy, tableARN,
 		bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
 			TrustedIssuers:   h.trustedIssuers(r),
+			Subject:          callerSubject(r),
 			IsLocalAccountID: h.localAccountIDs,
 			TableBucketName:  bucketName,
 			Namespace:        namespaceName,
@@ -2105,6 +2115,12 @@ func (h *S3TablesHandler) authorizeUpdateTable(w http.ResponseWriter, r *http.Re
 			h.writeError(w, http.StatusNotFound, ErrCodeNoSuchTable, "table not found")
 		}
 		return nil, NewAuthError("UpdateTable", principal, "not authorized to update table")
+	}
+
+	// After authorization, so a caller who may not update the table learns
+	// nothing about where its files live.
+	if err := h.refuseUpdatedMetadataLocation(w, r, filerClient, bucketName, namespaceName, tablePath, &metadata, req.MetadataLocation); err != nil {
+		return nil, err
 	}
 
 	return &updateTableTarget{
@@ -2359,6 +2375,7 @@ func (h *S3TablesHandler) authorizeCreateTable(w http.ResponseWriter, r *http.Re
 	identityActions := getIdentityActions(r)
 	policyContext := &PolicyContext{
 		TrustedIssuers:   h.trustedIssuers(r),
+		Subject:          callerSubject(r),
 		IsLocalAccountID: h.localAccountIDs,
 		TableBucketName:  bucketName,
 		Namespace:        namespaceName,
