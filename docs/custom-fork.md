@@ -19,7 +19,7 @@ merges the newest SeaweedFS release every six hours into the branch
   itself, and the push to `patched` publishes a new image.
 - **Conflicts:** the PR is labelled `fork-kit:conflict` and lists the
   conflicting files with the patches they belong to. Resolve them on
-  `fork-kit/sync` (`npx github:BierDav/fork-kit#v0.3.0 resolve`, or GitHub's
+  `fork-kit/sync` (`npx github:BierDav/fork-kit#v0.3.1 resolve`, or GitHub's
   conflict editor) and merge the PR yourself.
 - **Upstream changed `.github/`:** nothing is pushed until a human has reviewed
   the change. Run the fork-kit workflow with `allow-workflow-changes` once you
